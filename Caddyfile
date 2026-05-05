@@ -1,0 +1,4 @@
+localhost {
+    root * ./web
+    file_server
+}

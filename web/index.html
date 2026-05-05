@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP Tetris Control</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            background: #16213e;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            max-width: 400px;
+        }
+        h1 {
+            margin-bottom: 1rem;
+            color: #00d9ff;
+        }
+        .score {
+            font-size: 24px;
+            margin-bottom: 1rem;
+            color: #4ecca3;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 0.3rem;
+            transition: all 0.2s;
+        }
+        #connectBtn {
+            background: #00d9ff;
+            color: #1a1a2e;
+        }
+        #connectBtn:hover {
+            background: #00b8d9;
+        }
+        #connectBtn:disabled {
+            background: #555;
+            color: #888;
+            cursor: not-allowed;
+        }
+        .controls {
+            display: none;
+            margin-top: 1rem;
+        }
+        .control-row {
+            display: flex;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+        #leftBtn, #rightBtn, #rotateBtn {
+            background: #e94560;
+            color: white;
+        }
+        #leftBtn:hover, #rightBtn:hover, #rotateBtn:hover {
+            background: #c73e54;
+        }
+        #downBtn {
+            background: #ff9f43;
+            color: white;
+            width: 120px;
+        }
+        #downBtn:hover {
+            background: #e67e22;
+        }
+        #startBtn {
+            background: #4ecca3;
+            color: #1a1a2e;
+            margin-top: 1rem;
+        }
+        #startBtn:hover {
+            background: #3db892;
+        }
+        #status {
+            margin-top: 1rem;
+            color: #888;
+            font-size: 14px;
+        }
+        .error {
+            color: #e94560;
+        }
+        .success {
+            color: #4ecca3;
+        }
+        .instructions {
+            font-size: 12px;
+            color: #888;
+            margin-top: 1rem;
+            text-align: left;
+            padding: 1rem;
+            background: #0f1629;
+            border-radius: 8px;
+        }
+        .instructions h3 {
+            color: #00d9ff;
+            margin-bottom: 0.5rem;
+        }
+        .instructions ul {
+            margin-left: 1.2rem;
+        }
+        .instructions li {
+            margin-bottom: 0.3rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP Tetris</h1>
+        <div class="score">Score: <span id="scoreValue">0</span></div>
+        <button id="connectBtn">Connect</button>
+        <div class="controls" id="controls">
+            <div class="control-row">
+                <button id="leftBtn">← Left</button>
+                <button id="rotateBtn">↻ Rotate</button>
+                <button id="rightBtn">Right →</button>
+            </div>
+            <div class="control-row">
+                <button id="downBtn">↓ Drop</button>
+            </div>
+            <button id="startBtn">Start / Restart</button>
+        </div>
+        <p id="status">Not connected</p>
+        <div class="instructions">
+            <h3>How to Play</h3>
+            <ul>
+                <li><strong>Left / Right:</strong> Move piece horizontally</li>
+                <li><strong>Rotate:</strong> Rotate piece clockwise</li>
+                <li><strong>Drop:</strong> Drop piece faster</li>
+                <li><strong>Start:</strong> Start new game or restart after game over</li>
+            </ul>
+            <p style="margin-top: 0.5rem;">The game board is displayed on your ESP32's LED strip.</p>
+        </div>
+    </div>
+
+    <script>
+        const SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
+        const CONTROL_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef1';
+        const SCORE_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef2';
+
+        // Tetris control commands
+        const CMD_NONE = 0;
+        const CMD_LEFT = 1;
+        const CMD_RIGHT = 2;
+        const CMD_ROTATE = 3;
+        const CMD_DOWN = 4;
+        const CMD_START = 5;
+
+        let device = null;
+        let server = null;
+        let controlCharacteristic = null;
+
+        const connectBtn = document.getElementById('connectBtn');
+        const controlsDiv = document.getElementById('controls');
+        const status = document.getElementById('status');
+        const scoreValue = document.getElementById('scoreValue');
+
+        const leftBtn = document.getElementById('leftBtn');
+        const rightBtn = document.getElementById('rightBtn');
+        const rotateBtn = document.getElementById('rotateBtn');
+        const downBtn = document.getElementById('downBtn');
+        const startBtn = document.getElementById('startBtn');
+
+        async function sendCommand(cmd) {
+            if (!controlCharacteristic) return;
+            try {
+                await controlCharacteristic.writeValue(new Uint8Array([cmd]));
+            } catch (err) {
+                console.error('Write error:', err);
+            }
+        }
+
+        connectBtn.addEventListener('click', async () => {
+            try {
+                status.textContent = 'Connecting...';
+                status.className = '';
+
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ namePrefix: 'ESP' }],
+                    optionalServices: [SERVICE_UUID]
+                });
+
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+
+                server = await device.gatt.connect();
+                const service = await server.getPrimaryService(SERVICE_UUID);
+                controlCharacteristic = await service.getCharacteristic(CONTROL_CHAR_UUID);
+
+                connectBtn.style.display = 'none';
+                controlsDiv.style.display = 'block';
+                status.textContent = 'Connected';
+                status.className = 'success';
+            } catch (err) {
+                status.textContent = 'Error: ' + err.message;
+                status.className = 'error';
+                console.error(err);
+            }
+        });
+
+        leftBtn.addEventListener('click', () => sendCommand(CMD_LEFT));
+        rightBtn.addEventListener('click', () => sendCommand(CMD_RIGHT));
+        rotateBtn.addEventListener('click', () => sendCommand(CMD_ROTATE));
+        downBtn.addEventListener('click', () => sendCommand(CMD_DOWN));
+        startBtn.addEventListener('click', () => sendCommand(CMD_START));
+
+        async function onDisconnected() {
+            status.textContent = 'Disconnected';
+            status.className = 'error';
+            connectBtn.style.display = 'inline-block';
+            controlsDiv.style.display = 'none';
+            device = null;
+            server = null;
+            controlCharacteristic = null;
+        }
+    </script>
+</body>
+</html>
