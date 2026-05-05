@@ -48,7 +48,8 @@ trouble-host = { version = "0.6.0", features = ["gatt"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
 
-no_std_tetris = { path = "../no_std_tetris/no_std_tetris", package = "no_std_tetris" }
+no_std_tetris = { version="0.2", package = "no_std_tetris" }
+
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

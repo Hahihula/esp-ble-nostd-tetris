@@ -1328,7 +1328,9 @@ checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
 
 [[package]]
 name = "no_std_tetris"
-version = "0.1.1"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b53ca355cce9c1f175a50f465b8319f0c90224f07fad42d9f33490c3a22b3cc0"
 
 [[package]]
 name = "nu-ansi-term"
