@@ -95,6 +95,33 @@ fn extract_game_state(game: &Tetris<TetrisRng>) -> GameState {
     state
 }
 
+// Compare two game states to see if rendering is needed
+fn state_changed(old: &GameState, new: &GameState) -> bool {
+    if old.game_over != new.game_over {
+        return true;
+    }
+    // Compare colors by their discriminant (Color is an enum)
+    if core::mem::discriminant(&old.current_color) != core::mem::discriminant(&new.current_color) {
+        return true;
+    }
+    if old.piece_x != new.piece_x || old.piece_y != new.piece_y {
+        return true;
+    }
+    for i in 0..4 {
+        if old.current_piece[i] != new.current_piece[i] {
+            return true;
+        }
+    }
+    for y in 0..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            if core::mem::discriminant(&old.board[y][x]) != core::mem::discriminant(&new.board[y][x]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
@@ -376,13 +403,19 @@ async fn render_task(
     rmt_cell: &'static core::cell::RefCell<esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>>,
     game_from_gatt: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
 ) {
+    let mut last_state = GameState::default();
+
     loop {
         // Wait for new game state
         let state = game_from_gatt.receive().await;
 
-        // Render with exclusive access to RMT channel
-        let mut rmt = rmt_cell.borrow_mut();
-        render_board(&state, &mut rmt).await;
+        // Only render when state actually changes to avoid flickering
+        if state_changed(&last_state, &state) {
+            // Render with exclusive access to RMT channel
+            let mut rmt = rmt_cell.borrow_mut();
+            render_board(&state, &mut rmt).await;
+            last_state = state;
+        }
     }
 }
 
