@@ -10,7 +10,7 @@
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
-use embassy_futures::select::select;
+use embassy_futures::select::{select, Either};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Level, Output};
@@ -300,7 +300,7 @@ async fn gatt_game_task<P: PacketPool>(
     let mut cmd_processed = true;
 
     loop {
-        // Handle timing - auto fall
+        // Handle timing - auto fall (always check)
         let now = embassy_time::Instant::now();
         if now - last_update >= fall_interval {
             game.move_down();
@@ -329,38 +329,41 @@ async fn gatt_game_task<P: PacketPool>(
 
         // Send game state to render task (non-blocking, overwrite if full)
         let state = extract_game_state(&game);
-        // Try to send, but don't block if channel is full
         game_to_render.try_send(state).ok();
 
-        // Score polling - web page reads score directly
+        // Wait for either a BLE event or timeout, then process
+        // This ensures we check auto-fall at least every 50ms
+        let event = select(conn.next(), embassy_time::Timer::after_millis(50)).await;
 
-        // Check for incoming BLE events with timeout
-        match embassy_time::Timer::after_millis(10).await {
-            _ => {}
-        }
-
-        match conn.next().await {
-            GattConnectionEvent::Disconnected { .. } => break,
-            GattConnectionEvent::Gatt { event } => {
-                match &event {
-                    GattEvent::Write(event) => {
-                        if event.handle() == control_char.handle {
-                            let data = event.data();
-                            if !data.is_empty() {
-                                pending_cmd = data[0];
-                                cmd_processed = false;
-                                info!("[gatt] Tetris command: {}", pending_cmd);
+        match event {
+            Either::First(conn_event) => {
+                match conn_event {
+                    GattConnectionEvent::Disconnected { .. } => break,
+                    GattConnectionEvent::Gatt { event } => {
+                        match &event {
+                            GattEvent::Write(event) => {
+                                if event.handle() == control_char.handle {
+                                    let data = event.data();
+                                    if !data.is_empty() {
+                                        pending_cmd = data[0];
+                                        cmd_processed = false;
+                                        info!("[gatt] Tetris command: {}", pending_cmd);
+                                    }
+                                }
                             }
-                        }
+                            _ => {}
+                        };
+                        match event.accept() {
+                            Ok(reply) => reply.send().await,
+                            Err(e) => info!("[gatt] error sending response: {:?}", e),
+                        };
                     }
                     _ => {}
-                };
-                match event.accept() {
-                    Ok(reply) => reply.send().await,
-                    Err(e) => info!("[gatt] error sending response: {:?}", e),
-                };
+                }
             }
-            _ => {}
+            Either::Second(_) => {
+                // Timeout - continue loop to check auto-fall
+            }
         }
     }
     info!("[gatt] disconnected");
