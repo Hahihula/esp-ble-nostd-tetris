@@ -34,13 +34,17 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const BOARD_WIDTH: usize = 10;
 const BOARD_HEIGHT: usize = 20;
 const FALL_INTERVAL_MS: u64 = 500;
-const BRIGHTNESS: u8 = 12;
+const BRIGHTNESS: u8 = 120;
 
 // NeoPixel timing constants
-const T0H: u16 = 35;
-const T0L: u16 = 90;
-const T1H: u16 = 70;
-const T1L: u16 = 55;
+// const T0H: u16 = 35;
+// const T0L: u16 = 90;
+// const T1H: u16 = 70;
+// const T1L: u16 = 55;
+const T0H: u16 = 30; // 375ns (spec: 350±150)
+const T0L: u16 = 70; // 875ns (spec: 800±150)
+const T1H: u16 = 60; // 750ns (spec: 700±150)
+const T1L: u16 = 40; // 500ns (spec: 600±150)
 
 // Game state for rendering - sent from game task to render task
 // Uses plain array to avoid heap allocation
@@ -153,7 +157,8 @@ async fn main(_spawner: Spawner) {
     let tx_config = esp_hal::rmt::TxChannelConfig::default()
         .with_clk_divider(1)
         .with_idle_output_level(Level::Low)
-        .with_idle_output(false);
+        .with_idle_output(false)
+        .with_memsize(4);
 
     let channel = rmt
         .channel0
@@ -239,7 +244,7 @@ fn board_to_led_index(x: usize, y: usize, flip_y: bool) -> usize {
 async fn ble_tetris_run<C>(
     controller: C,
     status_led: &'static mut Output<'static>,
-    mut rmt_channel: esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>, // Take ownership directly
+    rmt_channel: esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>, // Take ownership directly
     game_to_render: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
 ) where
     C: Controller,
@@ -395,16 +400,16 @@ async fn render_task(
     
     // Pre-allocate all buffers
     let mut led_colors = [(0u8, 0u8, 0u8); 200];
-    
-    // For esp-hal 1.1, we need to build a Vec of PulseCode for all LEDs
-    // Using heapless for no_std compatibility
-    use heapless::Vec;
+    static PULSE_BUFFER: StaticCell<heapless::Vec<PulseCode, 5000>> = StaticCell::new();
+    let all_pulses = PULSE_BUFFER.init(heapless::Vec::new());
     
     loop {
         let state = game_from_gatt.receive().await;
         
         if state_changed(&last_state, &state) {
-            render_board_batched(&state, &mut rmt_channel, &mut led_colors).await;
+            all_pulses.clear(); // Reuse without reallocating
+            render_board_batched(&state, &mut rmt_channel, &mut led_colors, all_pulses).await;
+            embassy_time::Timer::after_micros(300).await; // ensure reset gap
             last_state = state;
         }
     }
@@ -415,8 +420,8 @@ async fn render_board_batched(
     state: &GameState,
     channel: &mut esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>,
     led_colors: &mut [(u8, u8, u8); 200],
+    all_pulses: &mut heapless::Vec<PulseCode, 5000>
 ) {
-    use heapless::Vec;
     
     // Clear colors
     for color in led_colors.iter_mut() {
@@ -445,10 +450,6 @@ async fn render_board_batched(
         }
     }
     
-    // Build complete pulse sequence for all LEDs
-    // 200 LEDs * 24 pulses per LED (3 bytes * 8 bits) + 1 reset pulse = 4801 pulses
-    let mut all_pulses = Vec::<PulseCode, 5000>::new();
-    
     for &(r, g, b) in led_colors.iter() {
         // Convert RGB to NeoPixel format (GRB order)
         let bytes = [g, r, b];
@@ -467,76 +468,13 @@ async fn render_board_batched(
     }
     
     // Add reset pulse (>50µs for WS2812B)
-    let _ = all_pulses.push(PulseCode::new(Level::Low, 1000, Level::Low, 0));
+    // let _ = all_pulses.push(PulseCode::new(Level::Low, 1000, Level::Low, 0));
+    let _ = all_pulses.push(PulseCode::new(Level::Low, 22400, Level::Low, 0));
     
     // Single transmission for entire frame - prevents partial updates
     if let Err(e) = channel.transmit(&all_pulses).await {
         info!("LED batch transmit error: {:?}", e);
     }
-}
-
-// Render game state to LED strip
-async fn render_board(
-    state: &GameState,
-    channel: &mut esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>,
-) {
-    let mut led_colors = [(0u8, 0u8, 0u8); 200];
-
-    // Render board state (locked cells)
-    for y in 0..BOARD_HEIGHT {
-        for x in 0..BOARD_WIDTH {
-            if let Some(color) = state.board[y][x] {
-                let led_idx = board_to_led_index(x, y, true);
-                led_colors[led_idx] = color_to_rgb(color);
-            }
-        }
-    }
-
-    // Render current piece (if not game over)
-    if !state.game_over {
-        for &(dx, dy) in &state.current_piece {
-            let x = (state.piece_x + dx) as usize;
-            let y = (state.piece_y + dy) as usize;
-            if x < BOARD_WIDTH && y < BOARD_HEIGHT {
-                let led_idx = board_to_led_index(x, y, true);
-                led_colors[led_idx] = color_to_rgb(state.current_color);
-            }
-        }
-    }
-
-    // Send data to LED strip
-    for (_, &(r, g, b)) in led_colors.iter().enumerate() {
-        let data = create_led_bits(r, g, b);
-        let rt = channel.transmit(&data);
-        match rt.await {
-            Ok(_) => {}
-            Err(e) => {
-                info!("LED transmit error: {:?}", e);
-                break;
-            }
-        }
-    }
-}
-
-fn create_led_bits(r: u8, g: u8, b: u8) -> [PulseCode; 25] {
-    use esp_hal::gpio::Level;
-
-    let mut data = [PulseCode::default(); 25];
-    let bytes = [g, r, b];
-
-    let mut idx = 0;
-    for byte in bytes {
-        for bit in (0..8).rev() {
-            data[idx] = if (byte & (1 << bit)) != 0 {
-                PulseCode::new(Level::High, T1H, Level::Low, T1L)
-            } else {
-                PulseCode::new(Level::High, T0H, Level::Low, T0L)
-            };
-            idx += 1;
-        }
-    }
-    data[24] = PulseCode::new(Level::Low, 800, Level::Low, 0);
-    data
 }
 
 async fn advertise<'values, 'server, C: Controller>(
