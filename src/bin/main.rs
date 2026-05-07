@@ -14,16 +14,23 @@ use embassy_futures::select::{select, Either};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Level, Output};
-use esp_hal::rmt::TxChannelCreator;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::ble::controller::BleConnector;
 use log::info;
 use no_std_tetris::{RandomGenerator, Tetris, Color};
-use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use esp_hal::rmt::PulseCode;
 use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use esp_hal::dma::{DmaTxBuf, DmaDescriptor};
+use esp_hal::spi::master::SpiDma;
+use nb;
+use static_cell::StaticCell;
+
+// 2 descriptors needed for buffers > 4095 bytes
+static TX_DESC: StaticCell<[esp_hal::dma::DmaDescriptor; 2]> = StaticCell::new();
+// 200 LEDs × 24 bits = 4800 bytes
+static SPI_BUF: StaticCell<[u8; 4800]> = StaticCell::new();
 
 extern crate alloc;
 
@@ -34,7 +41,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const BOARD_WIDTH: usize = 10;
 const BOARD_HEIGHT: usize = 20;
 const FALL_INTERVAL_MS: u64 = 500;
-const BRIGHTNESS: u8 = 120;
+const BRIGHTNESS: u8 = 12;
 
 // NeoPixel timing constants
 // const T0H: u16 = 35;
@@ -149,22 +156,14 @@ async fn main(_spawner: Spawner) {
     static STATUS_LED: StaticCell<Output<'static>> = StaticCell::new();
     let status_led = STATUS_LED.init(Output::new(peripherals.GPIO8, Level::Low, Default::default()));
 
-    let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80))
-        .unwrap()
-        .into_async();
-    log::info!("Configuring RMT for NeoPixel control on GPIO4");
-
-    let tx_config = esp_hal::rmt::TxChannelConfig::default()
-        .with_clk_divider(1)
-        .with_idle_output_level(Level::Low)
-        .with_idle_output(false)
-        .with_memsize(4);
-
-    let channel = rmt
-        .channel0
-        .configure_tx(&tx_config)
-        .unwrap()
-        .with_pin(peripherals.GPIO4);
+    let spi = esp_hal::spi::master::Spi::new(
+        peripherals.SPI2,
+        esp_hal::spi::master::Config::default().with_frequency(esp_hal::time::Rate::from_hz(6_400_000)),
+    )
+    .unwrap()
+    .with_mosi(peripherals.GPIO4)
+    .with_dma(peripherals.DMA_CH0)
+    .into_async();
 
     // Create channel for game state to renderer
     static RENDER_CHANNEL: StaticCell<Channel<CriticalSectionRawMutex, GameState, 1>> = StaticCell::new();
@@ -172,7 +171,7 @@ async fn main(_spawner: Spawner) {
     log::info!("Starting BLE Tetris peripheral task");
 
     // Move channel ownership directly - no unsafe needed
-    ble_tetris_run(controller, status_led, channel, game_to_render).await;
+    ble_tetris_run(controller, status_led, spi, game_to_render).await;
     log::info!("BLE Tetris peripheral task exited");
 }
 
@@ -244,7 +243,7 @@ fn board_to_led_index(x: usize, y: usize, flip_y: bool) -> usize {
 async fn ble_tetris_run<C>(
     controller: C,
     status_led: &'static mut Output<'static>,
-    rmt_channel: esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>, // Take ownership directly
+    spi: esp_hal::spi::master::SpiDma<'static, esp_hal::Async>,
     game_to_render: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
 ) where
     C: Controller,
@@ -270,7 +269,7 @@ async fn ble_tetris_run<C>(
 
     // Spawn render task with ownership of RMT channel
     let render_spawner = unsafe { embassy_executor::Spawner::for_current_executor() }.await;
-    render_spawner.spawn(render_task(rmt_channel, game_to_render).unwrap());
+    render_spawner.spawn(render_task(spi, game_to_render).unwrap());
 
     let _ = join(ble_task(runner), async {
         loop {
@@ -393,24 +392,71 @@ async fn gatt_game_task<P: PacketPool>(
 // Render task - receives game state and updates LED strip
 #[embassy_executor::task]
 async fn render_task(
-    mut rmt_channel: esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>,
+    mut spi: esp_hal::spi::master::SpiDma<'static, esp_hal::Async>,
     game_from_gatt: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
 ) {
     let mut last_state = GameState::default();
-    
-    // Pre-allocate all buffers
     let mut led_colors = [(0u8, 0u8, 0u8); 200];
-    static PULSE_BUFFER: StaticCell<heapless::Vec<PulseCode, 5000>> = StaticCell::new();
-    let all_pulses = PULSE_BUFFER.init(heapless::Vec::new());
-    
+
+    // Initialize with correct sizes
+    let descriptors = TX_DESC.init([esp_hal::dma::DmaDescriptor::EMPTY; 2]);
+    let buffer = SPI_BUF.init([0u8; 4800]);
+    let mut tx_buf = esp_hal::dma::DmaTxBuf::new(descriptors, buffer).unwrap();
+
     loop {
         let state = game_from_gatt.receive().await;
         
         if state_changed(&last_state, &state) {
-            all_pulses.clear(); // Reuse without reallocating
-            render_board_batched(&state, &mut rmt_channel, &mut led_colors, all_pulses).await;
-            embassy_time::Timer::after_micros(300).await; // ensure reset gap
+            render_board_spi(&state, &mut led_colors, tx_buf.as_mut_slice());
+            
+            let transfer = spi.write(tx_buf.len(),tx_buf).unwrap();
+            let (spi_ret, tx_buf_ret) = transfer.wait();
+            spi = spi_ret;
+            tx_buf = tx_buf_ret;
+            
+            embassy_time::Timer::after_micros(300).await;
             last_state = state;
+        }
+    }
+}
+
+fn render_board_spi(
+    state: &GameState,
+    led_colors: &mut [(u8, u8, u8); 200],
+    spi_buffer: &mut [u8],
+) {
+    // Clear colors
+    for color in led_colors.iter_mut() { *color = (0, 0, 0); }
+
+    // Map board state to colors
+    for y in 0..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            if let Some(color) = state.board[y][x] {
+                led_colors[board_to_led_index(x, y, true)] = color_to_rgb(color);
+            }
+        }
+    }
+    if !state.game_over {
+        for &(dx, dy) in &state.current_piece {
+            let x = (state.piece_x + dx) as usize;
+            let y = (state.piece_y + dy) as usize;
+            if x < BOARD_WIDTH && y < BOARD_HEIGHT {
+                led_colors[board_to_led_index(x, y, true)] = color_to_rgb(state.current_color);
+            }
+        }
+    }
+
+    // Convert GRB to SPI bitstream
+    // 1 NeoPixel bit = 1 SPI byte at ~6.4MHz
+    // '1' -> 0xF0 (11110000) -> ~625ns HIGH, ~625ns LOW (T1H spec: 550-850ns) ✅
+    // '0' -> 0xC0 (11000000) -> ~312ns HIGH, ~937ns LOW (T0H spec: 200-500ns) ✅
+    let mut idx = 0;
+    for &(r, g, b) in led_colors.iter() {
+        for byte in [g, r, b] { // WS2812B expects GRB order
+            for bit in (0..8).rev() { // MSB first matches SPI default
+                spi_buffer[idx] = if (byte & (1 << bit)) != 0 { 0xF0 } else { 0xC0 };
+                idx += 1;
+            }
         }
     }
 }
