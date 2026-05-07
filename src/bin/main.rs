@@ -145,33 +145,32 @@ async fn main(_spawner: Spawner) {
     static STATUS_LED: StaticCell<Output<'static>> = StaticCell::new();
     let status_led = STATUS_LED.init(Output::new(peripherals.GPIO8, Level::Low, Default::default()));
 
-    // GPIO4 for NeoPixel LED strip
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80))
         .unwrap()
         .into_async();
     log::info!("Configuring RMT for NeoPixel control on GPIO4");
+
     let tx_config = esp_hal::rmt::TxChannelConfig::default()
         .with_clk_divider(1)
         .with_idle_output_level(Level::Low)
         .with_idle_output(false);
+
     let channel = rmt
         .channel0
         .configure_tx(&tx_config)
         .unwrap()
         .with_pin(peripherals.GPIO4);
 
-    static RMT_CHANNEL: StaticCell<esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>> = StaticCell::new();
-    let rmt_channel = RMT_CHANNEL.init(channel);
-
     // Create channel for game state to renderer
-    // Using embassy-sync channel with capacity 1 (latest state only)
     static RENDER_CHANNEL: StaticCell<Channel<CriticalSectionRawMutex, GameState, 1>> = StaticCell::new();
     let game_to_render = RENDER_CHANNEL.init(Channel::new());
     log::info!("Starting BLE Tetris peripheral task");
 
-    ble_tetris_run(controller, status_led, rmt_channel, game_to_render).await;
+    // Move channel ownership directly - no unsafe needed
+    ble_tetris_run(controller, status_led, channel, game_to_render).await;
     log::info!("BLE Tetris peripheral task exited");
 }
+
 
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2;
@@ -240,7 +239,7 @@ fn board_to_led_index(x: usize, y: usize, flip_y: bool) -> usize {
 async fn ble_tetris_run<C>(
     controller: C,
     status_led: &'static mut Output<'static>,
-    rmt_channel: &'static esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>,
+    mut rmt_channel: esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>, // Take ownership directly
     game_to_render: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
 ) where
     C: Controller,
@@ -264,20 +263,9 @@ async fn ble_tetris_run<C>(
     }))
     .unwrap();
 
-    // Spawn render task with exclusive access to RMT channel
-    let rmt_owned = unsafe { core::ptr::read(rmt_channel) };
-
-    // Wrap in a static RefCell for interior mutability
-    static RMT_MUT: StaticCell<core::cell::RefCell<esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>>> = StaticCell::new();
-    let rmt_ref: &'static _ = RMT_MUT.init(core::cell::RefCell::new(rmt_owned));
-
+    // Spawn render task with ownership of RMT channel
     let render_spawner = unsafe { embassy_executor::Spawner::for_current_executor() }.await;
-    let token = render_task(rmt_ref, game_to_render);
-    if let Ok(t) = token {
-        render_spawner.spawn(t);
-    } else {
-        info!("Failed to create render task token");
-    }
+    render_spawner.spawn(render_task(rmt_channel, game_to_render).unwrap());
 
     let _ = join(ble_task(runner), async {
         loop {
@@ -400,22 +388,90 @@ async fn gatt_game_task<P: PacketPool>(
 // Render task - receives game state and updates LED strip
 #[embassy_executor::task]
 async fn render_task(
-    rmt_cell: &'static core::cell::RefCell<esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>>,
+    mut rmt_channel: esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>,
     game_from_gatt: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
 ) {
     let mut last_state = GameState::default();
-
+    
+    // Pre-allocate all buffers
+    let mut led_colors = [(0u8, 0u8, 0u8); 200];
+    
+    // For esp-hal 1.1, we need to build a Vec of PulseCode for all LEDs
+    // Using heapless for no_std compatibility
+    use heapless::Vec;
+    
     loop {
-        // Wait for new game state
         let state = game_from_gatt.receive().await;
-
-        // Only render when state actually changes to avoid flickering
+        
         if state_changed(&last_state, &state) {
-            // Render with exclusive access to RMT channel
-            let mut rmt = rmt_cell.borrow_mut();
-            render_board(&state, &mut rmt).await;
+            render_board_batched(&state, &mut rmt_channel, &mut led_colors).await;
             last_state = state;
         }
+    }
+}
+
+// Batched rendering - sends all LEDs in one transaction to prevent partial updates
+async fn render_board_batched(
+    state: &GameState,
+    channel: &mut esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>,
+    led_colors: &mut [(u8, u8, u8); 200],
+) {
+    use heapless::Vec;
+    
+    // Clear colors
+    for color in led_colors.iter_mut() {
+        *color = (0, 0, 0);
+    }
+    
+    // Render board state (locked cells)
+    for y in 0..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            if let Some(color) = state.board[y][x] {
+                let led_idx = board_to_led_index(x, y, true);
+                led_colors[led_idx] = color_to_rgb(color);
+            }
+        }
+    }
+    
+    // Render current piece
+    if !state.game_over {
+        for &(dx, dy) in &state.current_piece {
+            let x = (state.piece_x + dx) as usize;
+            let y = (state.piece_y + dy) as usize;
+            if x < BOARD_WIDTH && y < BOARD_HEIGHT {
+                let led_idx = board_to_led_index(x, y, true);
+                led_colors[led_idx] = color_to_rgb(state.current_color);
+            }
+        }
+    }
+    
+    // Build complete pulse sequence for all LEDs
+    // 200 LEDs * 24 pulses per LED (3 bytes * 8 bits) + 1 reset pulse = 4801 pulses
+    let mut all_pulses = Vec::<PulseCode, 5000>::new();
+    
+    for &(r, g, b) in led_colors.iter() {
+        // Convert RGB to NeoPixel format (GRB order)
+        let bytes = [g, r, b];
+        
+        for byte in bytes {
+            for bit in (0..8).rev() {
+                let pulse = if (byte & (1 << bit)) != 0 {
+                    PulseCode::new(Level::High, T1H, Level::Low, T1L)
+                } else {
+                    PulseCode::new(Level::High, T0H, Level::Low, T0L)
+                };
+                // For esp-hal 1.1, push directly - no Into<PulseCode> needed
+                let _ = all_pulses.push(pulse);
+            }
+        }
+    }
+    
+    // Add reset pulse (>50µs for WS2812B)
+    let _ = all_pulses.push(PulseCode::new(Level::Low, 1000, Level::Low, 0));
+    
+    // Single transmission for entire frame - prevents partial updates
+    if let Err(e) = channel.transmit(&all_pulses).await {
+        info!("LED batch transmit error: {:?}", e);
     }
 }
 
