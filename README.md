@@ -4,9 +4,10 @@ A no_std Tetris game running on ESP32-C3 with NeoPixel LED display, controllable
 
 ## Hardware Requirements
 
-- ESP32-C3 development board
-- NeoPixel RGB LED strip (10x20 matrix = 200 LEDs)
-- Connection status LED on GPIO8
+Only 2 main components plus 3D printed frame:
+- **ESP32-C3** development board
+- **NeoPixel RGB LED strip** (10x20 matrix = 200 LEDs, 30 LED/m)
+- **3D printed grid frame** (33mm squares): [Printables model](https://www.printables.com/model/1714687-modular-tetris-pixel-grid-33mm-squares-for-30ledm)
 
 ## Wiring
 
