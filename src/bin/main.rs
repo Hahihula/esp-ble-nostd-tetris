@@ -240,6 +240,22 @@ fn board_to_led_index(x: usize, y: usize, flip_y: bool) -> usize {
     }
 }
 
+async fn idle_mode_task(
+    game_to_render: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
+) -> ! {
+    loop {
+        let mut game = Tetris::new(TetrisRng);
+        game.piece_pos = (4, 9);
+
+        let mut state = extract_game_state(&game);
+        state.game_over = false; // Ensure piece is rendered
+
+        game_to_render.send(state).await;
+
+        embassy_time::Timer::after_secs(2).await;
+    }
+}
+
 async fn ble_tetris_run<C>(
     controller: C,
     status_led: &'static mut Output<'static>,
@@ -273,17 +289,19 @@ async fn ble_tetris_run<C>(
 
     let _ = join(ble_task(runner), async {
         loop {
-            match advertise(&mut peripheral, &server).await {
-                Ok(conn) => {
+            match select(advertise(&mut peripheral, &server), idle_mode_task(game_to_render)).await {
+                Either::First(Ok(conn)) => {
                     status_led.set_high();
                     let a = gatt_game_task(&server, &conn, status_led, game_to_render);
                     let b = connection_task();
                     select(a, b).await;
                     status_led.set_low();
                 }
-                Err(e) => {
+                Either::First(Err(e)) => {
                     info!("[adv] error: {:?}", e);
+                    embassy_time::Timer::after_millis(500).await;
                 }
+                Either::Second(_) => unreachable!(),
             }
         }
     })
