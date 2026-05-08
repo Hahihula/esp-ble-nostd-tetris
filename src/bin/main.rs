@@ -196,6 +196,8 @@ struct Server {
 struct TetrisService {
     #[characteristic(uuid = "12345678-1234-5678-1234-56789abcdef1", write)]
     control: u8,
+    #[characteristic(uuid = "12345678-1234-5678-1234-56789abcdef2", read, notify)]
+    score: u32,
 }
 
 struct TetrisRng;
@@ -307,18 +309,30 @@ async fn connection_task() {
 async fn gatt_game_task<P: PacketPool>(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
-    status_led: &mut Output<'static>,
+    _status_led: &mut Output<'static>,
     game_to_render: &'static Channel<CriticalSectionRawMutex, GameState, 1>,
 ) -> Result<(), Error> {
     let control_char = server.tetris_service.control;
+    let score_char = server.tetris_service.score;
 
     let mut game = Tetris::new(TetrisRng);
     let mut last_update = embassy_time::Instant::now();
     let fall_interval = embassy_time::Duration::from_millis(FALL_INTERVAL_MS);
     let mut pending_cmd = CMD_NONE;
     let mut cmd_processed = true;
+    let mut last_score = 0;
+
+    // Initial score
+    score_char.set(server, &0).ok();
 
     loop {
+        // Send score update if changed
+        if game.score != last_score {
+            last_score = game.score;
+            score_char.set(server, &last_score).ok();
+            score_char.notify(conn, &last_score).await.ok();
+        }
+
         // Handle timing - auto fall (always check)
         let now = embassy_time::Instant::now();
         if now - last_update >= fall_interval {
