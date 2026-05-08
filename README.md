@@ -73,7 +73,27 @@ Alternatively, serve locally:
 caddy run
 ```
 
-Then open http://localhost:443 in Chrome/Edge (Web Bluetooth required). ( Bluetooth web need https )
+### Browser Compatibility
+
+**Works in:**
+- Chrome on Android
+- Chrome/Edge on Windows
+- Chrome on macOS
+
+**Requires specialized browser:**
+- iPhone/iOS: Use [Bluefy](https://apps.apple.com/us/app/bluefy-web-ble-browser/id1492822055) or similar Web BLE browser, since Safari and other iOS browsers do not expose the Web Bluetooth API
+
+Web Bluetooth requires HTTPS. ( Bluetooth web need https )
+
+## Demo Purpose
+
+This project is a **toy demo** showcasing how BLE GATT servers can be used for IoT device control. The same patterns apply to real-world applications:
+
+- **Device provisioning**: Send WiFi credentials, configuration, or firmware updates via BLE
+- **Remote control**: Control actuators, motors, lights, or other peripherals
+- **Telemetry**: Read sensor data and display or log it in a web dashboard
+
+The Web Bluetooth interface demonstrates bidirectional communication between a web browser and embedded hardware - no native app required.
 
 ## Architecture
 
