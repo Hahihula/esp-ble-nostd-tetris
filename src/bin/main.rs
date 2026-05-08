@@ -19,12 +19,9 @@ use esp_radio::ble::controller::BleConnector;
 use log::info;
 use no_std_tetris::{RandomGenerator, Tetris, Color};
 use trouble_host::prelude::*;
-use esp_hal::rmt::PulseCode;
 use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use esp_hal::dma::{DmaTxBuf, DmaDescriptor};
-use esp_hal::spi::master::SpiDma;
-use nb;
 use static_cell::StaticCell;
 
 // 2 descriptors needed for buffers > 4095 bytes
@@ -41,17 +38,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const BOARD_WIDTH: usize = 10;
 const BOARD_HEIGHT: usize = 20;
 const FALL_INTERVAL_MS: u64 = 500;
-const BRIGHTNESS: u8 = 12;
-
-// NeoPixel timing constants
-// const T0H: u16 = 35;
-// const T0L: u16 = 90;
-// const T1H: u16 = 70;
-// const T1L: u16 = 55;
-const T0H: u16 = 30; // 375ns (spec: 350±150)
-const T0L: u16 = 70; // 875ns (spec: 800±150)
-const T1H: u16 = 60; // 750ns (spec: 700±150)
-const T1L: u16 = 40; // 500ns (spec: 600±150)
+const BRIGHTNESS: u8 = 250;
+const FLIP_Y: bool = false; // Set to true if LEDs are wired with row 0 at the bottom
 
 // Game state for rendering - sent from game task to render task
 // Uses plain array to avoid heap allocation
@@ -329,8 +317,16 @@ async fn gatt_game_task<P: PacketPool>(
         // Handle pending BLE command
         if !cmd_processed {
             match pending_cmd {
-                CMD_LEFT => { game.move_left(); }
-                CMD_RIGHT => { game.move_right(); }
+                CMD_LEFT => { if(FLIP_Y) {
+                        game.move_left();
+                    } else {
+                        game.move_right();
+                } }
+                CMD_RIGHT => { if(FLIP_Y) {
+                    game.move_right();                    
+                } else {
+                    game.move_left(); 
+                } }
                 CMD_ROTATE => { game.rotate(); }
                 CMD_DOWN => {
                     game.move_down();
@@ -432,7 +428,7 @@ fn render_board_spi(
     for y in 0..BOARD_HEIGHT {
         for x in 0..BOARD_WIDTH {
             if let Some(color) = state.board[y][x] {
-                led_colors[board_to_led_index(x, y, true)] = color_to_rgb(color);
+                led_colors[board_to_led_index(x, y, FLIP_Y)] = color_to_rgb(color);
             }
         }
     }
@@ -441,7 +437,7 @@ fn render_board_spi(
             let x = (state.piece_x + dx) as usize;
             let y = (state.piece_y + dy) as usize;
             if x < BOARD_WIDTH && y < BOARD_HEIGHT {
-                led_colors[board_to_led_index(x, y, true)] = color_to_rgb(state.current_color);
+                led_colors[board_to_led_index(x, y, FLIP_Y)] = color_to_rgb(state.current_color);
             }
         }
     }
@@ -458,68 +454,6 @@ fn render_board_spi(
                 idx += 1;
             }
         }
-    }
-}
-
-// Batched rendering - sends all LEDs in one transaction to prevent partial updates
-async fn render_board_batched(
-    state: &GameState,
-    channel: &mut esp_hal::rmt::Channel<'static, esp_hal::Async, esp_hal::rmt::Tx>,
-    led_colors: &mut [(u8, u8, u8); 200],
-    all_pulses: &mut heapless::Vec<PulseCode, 5000>
-) {
-    
-    // Clear colors
-    for color in led_colors.iter_mut() {
-        *color = (0, 0, 0);
-    }
-    
-    // Render board state (locked cells)
-    for y in 0..BOARD_HEIGHT {
-        for x in 0..BOARD_WIDTH {
-            if let Some(color) = state.board[y][x] {
-                let led_idx = board_to_led_index(x, y, true);
-                led_colors[led_idx] = color_to_rgb(color);
-            }
-        }
-    }
-    
-    // Render current piece
-    if !state.game_over {
-        for &(dx, dy) in &state.current_piece {
-            let x = (state.piece_x + dx) as usize;
-            let y = (state.piece_y + dy) as usize;
-            if x < BOARD_WIDTH && y < BOARD_HEIGHT {
-                let led_idx = board_to_led_index(x, y, true);
-                led_colors[led_idx] = color_to_rgb(state.current_color);
-            }
-        }
-    }
-    
-    for &(r, g, b) in led_colors.iter() {
-        // Convert RGB to NeoPixel format (GRB order)
-        let bytes = [g, r, b];
-        
-        for byte in bytes {
-            for bit in (0..8).rev() {
-                let pulse = if (byte & (1 << bit)) != 0 {
-                    PulseCode::new(Level::High, T1H, Level::Low, T1L)
-                } else {
-                    PulseCode::new(Level::High, T0H, Level::Low, T0L)
-                };
-                // For esp-hal 1.1, push directly - no Into<PulseCode> needed
-                let _ = all_pulses.push(pulse);
-            }
-        }
-    }
-    
-    // Add reset pulse (>50µs for WS2812B)
-    // let _ = all_pulses.push(PulseCode::new(Level::Low, 1000, Level::Low, 0));
-    let _ = all_pulses.push(PulseCode::new(Level::Low, 22400, Level::Low, 0));
-    
-    // Single transmission for entire frame - prevents partial updates
-    if let Err(e) = channel.transmit(&all_pulses).await {
-        info!("LED batch transmit error: {:?}", e);
     }
 }
 

@@ -50,7 +50,6 @@ static_cell      = "2.1.1"
 
 no_std_tetris = { version="0.2", package = "no_std_tetris" }
 heapless = "0.9.3"
-nb = "1.1"
 
 
 

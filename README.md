@@ -15,6 +15,23 @@ A no_std Tetris game running on ESP32-C3 with NeoPixel LED display, controllable
 | LED Strip Data | GPIO4 |
 | Status LED | GPIO8 |
 
+## LED Driving Method
+
+This project uses **SPI DMA** to drive the NeoPixel LED strip, not the RMT (Remote Control) peripheral.
+
+### Why SPI Instead of RMT?
+
+RMT (Remote Control peripheral) and BLE share hardware resources on ESP32-C3. When both are used simultaneously, RMT transfers cause BLE connection drops and communication errors. To maintain stable BLE connectivity, we drive NeoPixels via SPI DMA instead:
+
+- **SPI2** peripheral with DMA channel 0
+- **6.4 MHz SPI clock** - produces correct NeoPixel timing:
+  - '1' bit: 0xF0 (11110000) → ~625ns high, ~625ns low
+  - '0' bit: 0xC0 (11000000) → ~312ns high, ~937ns low
+- **DMA transfer** - non-blocking bulk transfer to LED strip
+- **Software reset** - 300μs gap after each frame (WS2812B requirement)
+
+This approach trades the RMT's hardware-assisted timing for BLE stability.
+
 ## Features
 
 - BLE GATT server for wireless control
