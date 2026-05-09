@@ -168,6 +168,7 @@
         let device = null;
         let server = null;
         let controlCharacteristic = null;
+        let scoreCharacteristic = null;
 
         const connectBtn = document.getElementById('connectBtn');
         const controlsDiv = document.getElementById('controls');
@@ -204,6 +205,22 @@
                 server = await device.gatt.connect();
                 const service = await server.getPrimaryService(SERVICE_UUID);
                 controlCharacteristic = await service.getCharacteristic(CONTROL_CHAR_UUID);
+                scoreCharacteristic = await service.getCharacteristic(SCORE_CHAR_UUID);
+
+                // Initial score read
+                try {
+                    const value = await scoreCharacteristic.readValue();
+                    scoreValue.textContent = value.getUint32(0, true);
+                } catch (err) {
+                    console.error('Initial score read error:', err);
+                }
+
+                await scoreCharacteristic.startNotifications();
+                scoreCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
+                    const value = event.target.value;
+                    const score = value.getUint32(0, true);
+                    scoreValue.textContent = score;
+                });
 
                 connectBtn.style.display = 'none';
                 controlsDiv.style.display = 'block';
@@ -227,9 +244,11 @@
             status.className = 'error';
             connectBtn.style.display = 'inline-block';
             controlsDiv.style.display = 'none';
+            scoreValue.textContent = '0';
             device = null;
             server = null;
             controlCharacteristic = null;
+            scoreCharacteristic = null;
         }
     </script>
 </body>
